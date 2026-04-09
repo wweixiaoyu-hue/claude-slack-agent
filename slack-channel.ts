@@ -1,6 +1,8 @@
 #!/usr/bin/env npx tsx
 
 import { App, LogLevel } from '@slack/bolt'
+import * as fs from 'fs'
+import * as path from 'path'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
@@ -188,9 +190,89 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   throw new Error(`unknown tool: ${name}`)
 })
 
-// Placeholder: message handler will be added in Task 4
+// ========== Allowlist ==========
+const allowlistPath = path.join(
+  process.env.HOME || process.env.USERPROFILE || '',
+  '.claude', 'channels', 'slack', 'access.json'
+)
+
+let allowlist = new Set<string>()
+
+function loadAllowlist(): void {
+  try {
+    const data = JSON.parse(fs.readFileSync(allowlistPath, 'utf-8'))
+    allowlist = new Set(data.allowed_users || [])
+    console.error(`[allowlist] loaded ${allowlist.size} user(s) from ${allowlistPath}`)
+  } catch {
+    allowlist = new Set()
+    console.error(`[allowlist] no allowlist found at ${allowlistPath} — all messages will be dropped`)
+  }
+}
+
+loadAllowlist()
+
+// ========== Slack Message Handler ==========
 slackApp.message(async ({ message }) => {
-  console.error('[slack] received message:', (message as any).text?.substring(0, 50))
+  // Type guard: only process plain user messages
+  if (message.type !== 'message') return
+  if ((message as any).subtype) return
+  if ((message as any).bot_id) return
+
+  const text = (message as any).text || ''
+  const user = (message as any).user as string
+  const channel = (message as any).channel as string
+  const messageTs = (message as any).ts as string
+  const threadTs = (message as any).thread_ts || messageTs // Default to message's own ts for threading
+
+  // Gate on allowlist
+  if (!allowlist.has(user)) return
+
+  // Add eyes reaction to acknowledge receipt
+  await slackApp.client.reactions.add({
+    channel,
+    timestamp: messageTs,
+    name: 'eyes',
+  }).catch(() => {}) // Best-effort
+
+  // Store pending message for status reaction tracking
+  const key = `${channel}:${threadTs}`
+  pendingMessages.set(key, { channel_id: channel, message_ts: messageTs })
+
+  // Resolve user display name
+  let userName = 'unknown'
+  try {
+    const userInfo = await slackApp.client.users.info({ user })
+    userName = (userInfo.user as any)?.real_name || (userInfo.user as any)?.name || 'unknown'
+  } catch {
+    console.error(`[slack] failed to resolve user name for ${user}`)
+  }
+
+  // Forward to Claude Code via MCP channel notification
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel' as any,
+      params: {
+        content: text,
+        meta: {
+          user_id: user,
+          user_name: userName,
+          channel_id: channel,
+          message_ts: messageTs,
+          thread_ts: threadTs,
+        },
+      },
+    })
+    console.error(`[slack] forwarded message from ${userName}: "${text.substring(0, 80)}"`)
+  } catch (err: any) {
+    console.error(`[slack] failed to forward message:`, err.message)
+    // Add x reaction on MCP forward failure
+    await slackApp.client.reactions.add({
+      channel,
+      timestamp: messageTs,
+      name: 'x',
+    }).catch(() => {})
+    pendingMessages.delete(key)
+  }
 })
 
 // ========== Start ==========
