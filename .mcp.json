@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "slack": {
+      "command": "npx",
+      "args": ["tsx", "slack-channel.ts"],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-...",
+        "SLACK_APP_TOKEN": "xapp-...",
+        "SLACK_SIGNING_SECRET": "..."
+      }
+    }
+  }
+}
