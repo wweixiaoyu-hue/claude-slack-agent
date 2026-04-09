@@ -10,6 +10,24 @@
 
 ---
 
+## Prerequisites: Slack App Setup
+
+1. Create app at [api.slack.com/apps](https://api.slack.com/apps) → From scratch
+2. Enable **Socket Mode** → create App-Level Token (scope: `connections:write`) → save `xapp-...` token
+3. **OAuth & Permissions** → add Bot Token Scopes:
+   - `chat:write` — send messages
+   - `reactions:write` — add emoji reactions
+   - `channels:history` — read channel messages
+   - `groups:history` — read private channel messages
+   - `users:read` — resolve user display names
+4. **Event Subscriptions** → enable → Subscribe to bot events:
+   - `message.channels` — messages in public channels
+   - `message.groups` — messages in private channels
+5. Install app to workspace → save Bot Token `xoxb-...`
+6. Copy Signing Secret from Basic Information page
+
+---
+
 ## Architecture
 
 ### Single-File Monolith
@@ -44,6 +62,32 @@ tsconfig.json          # TypeScript config (IDE support only)
 .gitignore             # Exclude .env, node_modules
 ```
 
+### .mcp.json
+
+```json
+{
+  "mcpServers": {
+    "slack": {
+      "command": "bun",
+      "args": ["slack-channel.ts"],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-...",
+        "SLACK_APP_TOKEN": "xapp-...",
+        "SLACK_SIGNING_SECRET": "..."
+      }
+    }
+  }
+}
+```
+
+### .env.example
+
+```
+SLACK_BOT_TOKEN=xoxb-your-token
+SLACK_APP_TOKEN=xapp-your-token
+SLACK_SIGNING_SECRET=your-secret
+```
+
 ---
 
 ## Data Flow
@@ -59,8 +103,10 @@ tsconfig.json          # TypeScript config (IDE support only)
 7. Server sends MCP notification:
    ```
    method: notifications/claude/channel
-   params: { content, meta: { channel_id, user_id, user_name, thread_ts } }
+   params: { content, meta: { channel_id, user_id, user_name, message_ts, thread_ts } }
    ```
+   - `message_ts`: the timestamp of this specific message (needed for reactions)
+   - `thread_ts`: defaults to `message.ts` if not in a thread, so replies always thread under the original message
 8. Claude Code receives as `<channel source="slack" ...>` XML tag
 
 ### Message Out (Claude Code -> Slack)
@@ -71,10 +117,12 @@ tsconfig.json          # TypeScript config (IDE support only)
 
 ### Status Indicators
 
-Automatic emoji reactions on the original message:
-- `eyes` — message received, processing
-- `white_check_mark` — reply sent successfully
-- `x` — error occurred during processing
+Automatic emoji reactions on the original message, applied by the **server itself** (not by Claude via the `react` tool):
+- `eyes` — added by the message handler immediately upon receiving a valid allowlisted message, before forwarding to Claude. Requires storing `message.ts` and `channel` for later use.
+- `white_check_mark` — added by the `reply` tool handler after `chat.postMessage` succeeds. The tool handler looks up the original `message_ts` and `channel_id` from stored state.
+- `x` — added by the `reply` tool handler if `chat.postMessage` fails, or by the message handler if MCP notification fails.
+
+**State tracking:** The server maintains a map of `channel_id + thread_ts` → `message_ts` so that tool handlers can react to the correct original message.
 
 ---
 
@@ -137,10 +185,16 @@ bullet points, and code blocks sparingly.
 - Ignore message subtypes (edits, joins, topic changes, etc.)
 - Only process plain user messages
 
+### Message Loop Prevention
+
+- Ignore messages with `message.subtype` present
+- Additionally check `message.bot_id` — reject if present (guards against bot-to-bot loops)
+
 ### Permission Model
 
 - Claude Code runs with `--dangerously-skip-permissions` (auto-approve all)
 - No remote permission approval relay (removed for simplicity)
+- **Important:** The MCP capabilities must NOT declare `'claude/channel/permission'` — only declare `'claude/channel'` and `tools`. Declaring the permission capability without implementing the relay would cause Claude Code to wait for approvals that never come.
 - Security relies entirely on the allowlist gating who can send commands
 
 ---
@@ -161,7 +215,8 @@ bullet points, and code blocks sparingly.
 
 1. Load environment variables (from process.env)
 2. Initialize Slack Bolt App with Socket Mode
-3. Initialize MCP Server with `claude/channel` capability
+   - **Critical:** Configure Bolt's logger to write to stderr only. MCP uses stdout for its JSON-RPC protocol — any Bolt output to stdout will corrupt the MCP transport and break the connection. Use a custom logger or set `logLevel: LogLevel.ERROR` with stderr redirect.
+3. Initialize MCP Server with `claude/channel` capability (NOT `claude/channel/permission`)
 4. Load user allowlist from disk
 5. Register Slack message handler
 6. Connect MCP via StdioServerTransport
@@ -222,3 +277,7 @@ Dev dependencies: `typescript`, `@types/node` (for IDE support).
 - **Not in Slack whitelist:** Must use `--dangerously-load-development-channels` flag
 - **Single session:** One Claude Code instance at a time per channel server
 - **No message buffering:** If Claude Code is not running, Slack messages are lost
+- **Allowlist not hot-reloaded:** Changes to `access.json` require restarting the Claude Code session
+- **Message length:** Slack's `chat.postMessage` has a 40,000 character limit. Long Claude responses may need chunking (split into multiple messages). The `reply` tool handler should split on paragraph boundaries if text exceeds the limit.
+- **No graceful shutdown:** When Claude Code exits, the Slack WebSocket may linger briefly. Acceptable for a personal tool.
+- **stdout is reserved:** All logging MUST go to stderr. Any stdout output breaks the MCP protocol.
