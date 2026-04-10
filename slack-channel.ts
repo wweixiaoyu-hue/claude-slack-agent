@@ -442,12 +442,24 @@ loadAllowlist()
 
 // ========== Slack Message Handler ==========
 slackApp.message(async ({ message }) => {
-  // Type guard: only process plain user messages
+  // Type guard: only process user messages (plain text or file shares)
   if (message.type !== 'message') return
-  if ((message as any).subtype) return
+  const subtype = (message as any).subtype
+  if (subtype && subtype !== 'file_share') return
   if ((message as any).bot_id) return
 
-  const text = (message as any).text || ''
+  let text = (message as any).text || ''
+
+  // Append file info for file_share messages
+  const files = (message as any).files as any[] | undefined
+  if (files && files.length > 0) {
+    const fileDescriptions = files.map((f: any) => {
+      const name = f.name || 'unknown'
+      const url = f.url_private || f.permalink || ''
+      return `[附件: ${name}]${url ? ` ${url}` : ''}`
+    }).join('\n')
+    text = text ? `${text}\n${fileDescriptions}` : fileDescriptions
+  }
   const user = (message as any).user as string
   const channel = (message as any).channel as string
   const messageTs = (message as any).ts as string
