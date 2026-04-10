@@ -58,6 +58,65 @@ let currentMessage: QueuedMessage | null = null
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null
 let lastHeartbeatPeriod = 0
 
+// ========== Conversation Context ==========
+interface ConversationEntry {
+  role: 'user' | 'assistant'
+  user_name?: string
+  content: string
+  ts: number  // Date.now() for timeout calculation
+}
+
+const conversations = new Map<string, ConversationEntry[]>()
+const CONTEXT_MAX_ENTRIES = 20        // Keep last 20 exchanges (10 rounds)
+const CONTEXT_TIMEOUT_MS = 30 * 60 * 1000  // 30 min inactivity = new conversation
+
+function getConversationKey(channel_id: string, thread_ts: string, message_ts: string): string {
+  // DM channels (D...) and group DMs: use channel_id as key (messages are rarely threaded)
+  // Public/private channels (C.../G...): use thread if threaded, otherwise channel_id
+  if (channel_id.startsWith('D')) return channel_id
+  return thread_ts !== message_ts ? `${channel_id}:${thread_ts}` : channel_id
+}
+
+function getConversationHistory(key: string): ConversationEntry[] {
+  const history = conversations.get(key)
+  if (!history || history.length === 0) return []
+
+  // Check timeout: if last entry is older than threshold, clear and start fresh
+  const lastEntry = history[history.length - 1]
+  if (Date.now() - lastEntry.ts > CONTEXT_TIMEOUT_MS) {
+    conversations.delete(key)
+    return []
+  }
+  return history
+}
+
+function addToConversation(key: string, entry: ConversationEntry): void {
+  let history = conversations.get(key)
+  if (!history) {
+    history = []
+    conversations.set(key, history)
+  }
+  history.push(entry)
+  // Trim to max entries
+  if (history.length > CONTEXT_MAX_ENTRIES) {
+    history.splice(0, history.length - CONTEXT_MAX_ENTRIES)
+  }
+}
+
+function formatContextForMCP(history: ConversationEntry[], newMessage: string, userName: string): string {
+  if (history.length === 0) return newMessage
+
+  const lines = history.map(e => {
+    if (e.role === 'user') {
+      return `[${e.user_name || 'user'}]: ${e.content}`
+    } else {
+      return `[assistant]: ${e.content}`
+    }
+  })
+
+  return `<conversation_history>\n${lines.join('\n')}\n</conversation_history>\n\n[${userName}]: ${newMessage}`
+}
+
 // ========== Helpers ==========
 const SLACK_MAX_LENGTH = 39_000 // Leave margin below Slack's 40k limit
 const TIMEOUT_S = 300
@@ -200,12 +259,20 @@ async function processNext(): Promise<void> {
     user: next.user_name,
   })
 
+  // Build content with conversation history
+  const convKey = getConversationKey(next.channel_id, next.thread_ts, next.message_ts)
+  const history = getConversationHistory(convKey)
+  const contentWithContext = formatContextForMCP(history, next.text, next.user_name)
+
+  // Record user message in conversation
+  addToConversation(convKey, { role: 'user', user_name: next.user_name, content: next.text, ts: Date.now() })
+
   // Send MCP notification
   try {
     await mcp.notification({
       method: 'notifications/claude/channel' as any,
       params: {
-        content: next.text,
+        content: contentWithContext,
         meta: {
           user_id: next.user_id,
           user_name: next.user_name,
@@ -215,7 +282,7 @@ async function processNext(): Promise<void> {
         },
       },
     })
-    console.error(`[queue] processing message from ${next.user_name}: "${next.text.substring(0, 80)}"`)
+    console.error(`[queue] processing message from ${next.user_name}: "${next.text.substring(0, 80)}" (history: ${history.length} entries)`)
   } catch (err: any) {
     console.error(`[queue] MCP notification failed:`, err.message)
     next.status = 'failed'
@@ -341,6 +408,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (currentMessage.channel_id !== channel_id || currentMessage.thread_ts !== thread_ts) {
           console.error(`[reply] WARNING: reply params (${channel_id}:${thread_ts}) do not match current message (${currentMessage.channel_id}:${currentMessage.thread_ts})`)
         }
+
+        // Save assistant reply to conversation history
+        const convKey = getConversationKey(currentMessage.channel_id, currentMessage.thread_ts, currentMessage.message_ts)
+        addToConversation(convKey, { role: 'assistant', content: text, ts: Date.now() })
         const wasTimeout = currentMessage.status === 'timeout'
         currentMessage.status = 'completed'
         currentMessage.completed_at = Date.now()
