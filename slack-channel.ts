@@ -52,13 +52,48 @@ Keep responses concise — the user is reading on a phone. Use short paragraphs,
   },
 )
 
-// ========== State Tracking ==========
-// Maps "channel_id:thread_ts" → message_ts of the original user message.
-// Used by the reply tool handler to add status reactions to the correct message.
-const pendingMessages = new Map<string, { channel_id: string; message_ts: string }>()
+// ========== Queue State ==========
+const queue: QueuedMessage[] = []
+let currentMessage: QueuedMessage | null = null
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+let lastHeartbeatPeriod = 0
 
 // ========== Helpers ==========
 const SLACK_MAX_LENGTH = 39_000 // Leave margin below Slack's 40k limit
+const TIMEOUT_S = 300
+const HEARTBEAT_START_S = 60
+const HEARTBEAT_INTERVAL_S = 30
+const TIMER_CHECK_S = 10
+const RESERVED_EMOJI = new Set(['eyes', 'hourglass_flowing_sand', 'white_check_mark', 'alarm_clock', 'x'])
+
+interface QueuedMessage {
+  id: string
+  text: string
+  user_id: string
+  user_name: string
+  channel_id: string
+  message_ts: string
+  thread_ts: string
+  status: 'queued' | 'processing' | 'completed' | 'failed' | 'timeout'
+  enqueued_at: number
+  processing_started_at?: number
+  completed_at?: number
+  error?: string
+}
+
+type LogEvent = 'process_started' | 'enqueued' | 'processing_started' | 'heartbeat' | 'completed' | 'timeout' | 'failed'
+
+interface LogEntry {
+  event: LogEvent
+  id?: string
+  user?: string
+  text?: string
+  queue_length?: number
+  elapsed_s?: number
+  duration_s?: number
+  was_timeout?: boolean
+  error?: string
+}
 
 function chunkText(text: string, maxLen: number): string[] {
   const chunks: string[] = []
@@ -81,6 +116,74 @@ function chunkText(text: string, maxLen: number): string[] {
 
   if (remaining) chunks.push(remaining)
   return chunks
+}
+
+// ========== Logging ==========
+let logDirCreated = false
+const logDir = path.join(
+  process.env.HOME || process.env.USERPROFILE || '',
+  '.claude', 'channels', 'slack', 'logs',
+)
+
+function writeLog(entry: LogEntry): void {
+  try {
+    if (!logDirCreated) {
+      fs.mkdirSync(logDir, { recursive: true })
+      logDirCreated = true
+    }
+    const date = new Date().toISOString().slice(0, 10)
+    const logPath = path.join(logDir, `${date}.jsonl`)
+    fs.appendFileSync(logPath, JSON.stringify({ ...entry, ts: new Date().toISOString() }) + '\n')
+  } catch (err: any) {
+    console.error('[log] write failed:', err.message)
+  }
+}
+
+// ========== Reaction Helper ==========
+async function setReaction(channel: string, ts: string, add: string, remove?: string): Promise<void> {
+  if (remove) {
+    await slackApp.client.reactions.remove({ channel, timestamp: ts, name: remove }).catch(() => {})
+  }
+  await slackApp.client.reactions.add({ channel, timestamp: ts, name: add }).catch(() => {})
+}
+
+// ========== Queue Functions ==========
+async function enqueue(msg: Omit<QueuedMessage, 'id' | 'status' | 'enqueued_at'>): Promise<void> {
+  const item: QueuedMessage = {
+    ...msg,
+    id: `${msg.channel_id}:${msg.message_ts}`,
+    status: 'queued',
+    enqueued_at: Date.now(),
+  }
+  queue.push(item)
+
+  writeLog({
+    event: 'enqueued',
+    id: item.id,
+    user: item.user_name,
+    text: item.text,
+    queue_length: queue.length,
+  })
+
+  // If there are messages ahead, notify the user and add eyes reaction
+  const ahead = queue.filter(m => m.status === 'queued').length - 1 + (currentMessage ? 1 : 0)
+  if (ahead > 0) {
+    await setReaction(item.channel_id, item.message_ts, 'eyes')
+    await slackApp.client.chat.postMessage({
+      channel: item.channel_id,
+      text: `排队中，前面还有 ${ahead} 条消息等待处理`,
+      thread_ts: item.thread_ts,
+    }).catch(() => {})
+  }
+
+  // If nothing is currently processing, start
+  if (!currentMessage) {
+    await processNext()
+  }
+}
+
+async function processNext(): Promise<void> {
+  // TODO: implement in Task 4
 }
 
 // ========== MCP Tools ==========
