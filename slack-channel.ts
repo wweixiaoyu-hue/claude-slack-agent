@@ -321,9 +321,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       thread_ts: string
     }
 
-    // Key must match the one stored by the message handler (channel_id:threadTs)
-    const key = `${channel_id}:${thread_ts}`
-
     try {
       // Chunk long messages to stay under Slack's 40k limit
       if (text.length > SLACK_MAX_LENGTH) {
@@ -335,28 +332,50 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         await slackApp.client.chat.postMessage({ channel: channel_id, text, thread_ts })
       }
 
-      // Add checkmark reaction to the original message
-      const pending = pendingMessages.get(key)
-      if (pending) {
-        await slackApp.client.reactions.add({
-          channel: pending.channel_id,
-          timestamp: pending.message_ts,
-          name: 'white_check_mark',
-        }).catch(() => {}) // Best-effort
-        pendingMessages.delete(key)
+      // Queue bookkeeping
+      if (currentMessage) {
+        const wasTimeout = currentMessage.status === 'timeout'
+        currentMessage.status = 'completed'
+        currentMessage.completed_at = Date.now()
+        const duration_s = Math.floor((currentMessage.completed_at - (currentMessage.processing_started_at || currentMessage.enqueued_at)) / 1000)
+
+        await setReaction(currentMessage.channel_id, currentMessage.message_ts, 'white_check_mark', 'hourglass_flowing_sand')
+        // Clean up alarm_clock if message had timed out
+        if (wasTimeout) {
+          await slackApp.client.reactions.remove({
+            channel: currentMessage.channel_id, timestamp: currentMessage.message_ts, name: 'alarm_clock',
+          }).catch(() => {})
+        }
+
+        writeLog({
+          event: 'completed',
+          id: currentMessage.id,
+          duration_s,
+          was_timeout: wasTimeout || undefined,
+        })
+
+        // Prune completed/failed entries to prevent unbounded memory growth
+        const idx = queue.indexOf(currentMessage)
+        if (idx >= 0) queue.splice(0, idx + 1)
+
+        stopTimer()
+        currentMessage = null
+        await processNext()
       }
 
       return { content: [{ type: 'text', text: 'sent' }] }
     } catch (err: any) {
-      // Add x reaction on failure
-      const pending = pendingMessages.get(key)
-      if (pending) {
-        await slackApp.client.reactions.add({
-          channel: pending.channel_id,
-          timestamp: pending.message_ts,
-          name: 'x',
-        }).catch(() => {})
-        pendingMessages.delete(key)
+      // Mark failure on current message
+      if (currentMessage) {
+        currentMessage.status = 'failed'
+        currentMessage.error = err.message
+        await setReaction(currentMessage.channel_id, currentMessage.message_ts, 'x', 'hourglass_flowing_sand')
+        writeLog({ event: 'failed', id: currentMessage.id, error: err.message })
+        const idx = queue.indexOf(currentMessage)
+        if (idx >= 0) queue.splice(0, idx + 1)
+        stopTimer()
+        currentMessage = null
+        await processNext()
       }
 
       console.error('[reply] error:', err.message)
@@ -370,11 +389,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       message_ts: string
       emoji: string
     }
+    const cleanEmoji = emoji.replace(/:/g, '')
+    if (RESERVED_EMOJI.has(cleanEmoji)) {
+      return {
+        content: [{ type: 'text', text: `error: emoji "${cleanEmoji}" is reserved for queue status` }],
+        isError: true,
+      }
+    }
     try {
       await slackApp.client.reactions.add({
         channel: channel_id,
         timestamp: message_ts,
-        name: emoji.replace(/:/g, ''),
+        name: cleanEmoji,
       })
       return { content: [{ type: 'text', text: 'reacted' }] }
     } catch (err: any) {
@@ -418,21 +444,10 @@ slackApp.message(async ({ message }) => {
   const user = (message as any).user as string
   const channel = (message as any).channel as string
   const messageTs = (message as any).ts as string
-  const threadTs = (message as any).thread_ts || messageTs // Default to message's own ts for threading
+  const threadTs = (message as any).thread_ts || messageTs
 
   // Gate on allowlist
   if (!allowlist.has(user)) return
-
-  // Add eyes reaction to acknowledge receipt
-  await slackApp.client.reactions.add({
-    channel,
-    timestamp: messageTs,
-    name: 'eyes',
-  }).catch(() => {}) // Best-effort
-
-  // Store pending message for status reaction tracking
-  const key = `${channel}:${threadTs}`
-  pendingMessages.set(key, { channel_id: channel, message_ts: messageTs })
 
   // Resolve user display name
   let userName = 'unknown'
@@ -443,36 +458,20 @@ slackApp.message(async ({ message }) => {
     console.error(`[slack] failed to resolve user name for ${user}`)
   }
 
-  // Forward to Claude Code via MCP channel notification
-  try {
-    await mcp.notification({
-      method: 'notifications/claude/channel' as any,
-      params: {
-        content: text,
-        meta: {
-          user_id: user,
-          user_name: userName,
-          channel_id: channel,
-          message_ts: messageTs,
-          thread_ts: threadTs,
-        },
-      },
-    })
-    console.error(`[slack] forwarded message from ${userName}: "${text.substring(0, 80)}"`)
-  } catch (err: any) {
-    console.error(`[slack] failed to forward message:`, err.message)
-    // Add x reaction on MCP forward failure
-    await slackApp.client.reactions.add({
-      channel,
-      timestamp: messageTs,
-      name: 'x',
-    }).catch(() => {})
-    pendingMessages.delete(key)
-  }
+  // Enqueue for serial processing
+  await enqueue({
+    text,
+    user_id: user,
+    user_name: userName,
+    channel_id: channel,
+    message_ts: messageTs,
+    thread_ts: threadTs,
+  })
 })
 
 // ========== Start ==========
 // MCP transport must connect BEFORE Slack starts (Claude Code expects stdio handshake first)
 await mcp.connect(new StdioServerTransport())
 await slackApp.start()
+writeLog({ event: 'process_started', id: 'system' })
 console.error('[slack-channel] Server ready — Slack connected, MCP channel active')
