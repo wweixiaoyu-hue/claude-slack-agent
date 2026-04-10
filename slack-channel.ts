@@ -183,7 +183,100 @@ async function enqueue(msg: Omit<QueuedMessage, 'id' | 'status' | 'enqueued_at'>
 }
 
 async function processNext(): Promise<void> {
-  // TODO: implement in Task 4
+  // Find next queued message
+  const next = queue.find(m => m.status === 'queued')
+  if (!next) return
+
+  currentMessage = next
+  next.status = 'processing'
+  next.processing_started_at = Date.now()
+
+  // Update reaction: remove eyes (if it was waiting), add hourglass
+  await setReaction(next.channel_id, next.message_ts, 'hourglass_flowing_sand', 'eyes')
+
+  writeLog({
+    event: 'processing_started',
+    id: next.id,
+    user: next.user_name,
+  })
+
+  // Send MCP notification
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel' as any,
+      params: {
+        content: next.text,
+        meta: {
+          user_id: next.user_id,
+          user_name: next.user_name,
+          channel_id: next.channel_id,
+          message_ts: next.message_ts,
+          thread_ts: next.thread_ts,
+        },
+      },
+    })
+    console.error(`[queue] processing message from ${next.user_name}: "${next.text.substring(0, 80)}"`)
+  } catch (err: any) {
+    console.error(`[queue] MCP notification failed:`, err.message)
+    next.status = 'failed'
+    next.error = err.message
+    await setReaction(next.channel_id, next.message_ts, 'x', 'hourglass_flowing_sand')
+    writeLog({ event: 'failed', id: next.id, error: err.message })
+    const idx = queue.indexOf(next)
+    if (idx >= 0) queue.splice(0, idx + 1)
+    currentMessage = null
+    await processNext()
+    return
+  }
+
+  // Start heartbeat/timeout timer
+  // Initialize to (HEARTBEAT_START_S / HEARTBEAT_INTERVAL_S - 1) so first heartbeat fires at HEARTBEAT_START_S
+  lastHeartbeatPeriod = Math.floor(HEARTBEAT_START_S / HEARTBEAT_INTERVAL_S) - 1
+  startTimer()
+}
+
+function startTimer(): void {
+  stopTimer()
+  heartbeatTimer = setInterval(async () => {
+    if (!currentMessage || !currentMessage.processing_started_at) return
+
+    const elapsed_s = Math.floor((Date.now() - currentMessage.processing_started_at) / 1000)
+
+    // Timeout check (only fire once)
+    if (elapsed_s >= TIMEOUT_S && currentMessage.status !== 'timeout') {
+      currentMessage.status = 'timeout'
+      await setReaction(currentMessage.channel_id, currentMessage.message_ts, 'alarm_clock')
+      writeLog({ event: 'timeout', id: currentMessage.id, elapsed_s })
+      await slackApp.client.chat.postMessage({
+        channel: currentMessage.channel_id,
+        text: `处理已超时(${TIMEOUT_S}s)，仍在等待回复...`,
+        thread_ts: currentMessage.thread_ts,
+      }).catch(() => {})
+      return // Stop heartbeat after timeout
+    }
+
+    // Heartbeat check (only while not timed out)
+    if (currentMessage.status === 'processing') {
+      const period = Math.floor(elapsed_s / HEARTBEAT_INTERVAL_S)
+      if (elapsed_s >= HEARTBEAT_START_S && period > lastHeartbeatPeriod) {
+        lastHeartbeatPeriod = period
+        const waiting = queue.filter(m => m.status === 'queued').length
+        writeLog({ event: 'heartbeat', id: currentMessage.id, elapsed_s, queue_length: waiting })
+        await slackApp.client.chat.postMessage({
+          channel: currentMessage.channel_id,
+          text: `仍在处理中... (已用时 ${elapsed_s}s，队列中还有 ${waiting} 条)`,
+          thread_ts: currentMessage.thread_ts,
+        }).catch(() => {})
+      }
+    }
+  }, TIMER_CHECK_S * 1000)
+}
+
+function stopTimer(): void {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer)
+    heartbeatTimer = null
+  }
 }
 
 // ========== MCP Tools ==========
