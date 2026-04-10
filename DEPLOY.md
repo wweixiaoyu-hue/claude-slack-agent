@@ -183,7 +183,7 @@ Set-Content -Path "$env:USERPROFILE\.claude\channels\slack\access.json" -Value '
 ```bash
 cd claude-slack-agent
 
-claude --dangerously-skip-permissions
+claude --dangerously-skip-permissions --dangerously-load-development-channels server:slack
 ```
 
 启动后 Claude Code 会自动：
@@ -223,7 +223,7 @@ tmux new -s claude-slack
 
 # 在 tmux 中启动
 cd ~/claude-slack-agent
-claude --dangerously-skip-permissions
+claude --dangerously-skip-permissions --dangerously-load-development-channels server:slack
 
 # 分离会话: Ctrl+B, D
 # 重新连接: tmux attach -t claude-slack
@@ -239,7 +239,7 @@ Windows 上最简单的方式是保持一个终端窗口运行 Claude Code。或
 
 ```bash
 npm install -g pm2
-pm2 start "claude --dangerously-skip-permissions" --name claude-slack --cwd /path/to/claude-slack-agent
+pm2 start "claude --dangerously-skip-permissions --dangerously-load-development-channels server:slack" --name claude-slack --cwd /path/to/claude-slack-agent
 pm2 save
 pm2 startup  # 设置开机自启
 ```
