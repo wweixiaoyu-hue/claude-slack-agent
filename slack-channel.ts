@@ -238,36 +238,40 @@ async function processNext(): Promise<void> {
 function startTimer(): void {
   stopTimer()
   heartbeatTimer = setInterval(async () => {
-    if (!currentMessage || !currentMessage.processing_started_at) return
+    try {
+      if (!currentMessage || !currentMessage.processing_started_at) return
 
-    const elapsed_s = Math.floor((Date.now() - currentMessage.processing_started_at) / 1000)
+      const elapsed_s = Math.floor((Date.now() - currentMessage.processing_started_at) / 1000)
 
-    // Timeout check (only fire once)
-    if (elapsed_s >= TIMEOUT_S && currentMessage.status !== 'timeout') {
-      currentMessage.status = 'timeout'
-      await setReaction(currentMessage.channel_id, currentMessage.message_ts, 'alarm_clock')
-      writeLog({ event: 'timeout', id: currentMessage.id, elapsed_s })
-      await slackApp.client.chat.postMessage({
-        channel: currentMessage.channel_id,
-        text: `处理已超时(${TIMEOUT_S}s)，仍在等待回复...`,
-        thread_ts: currentMessage.thread_ts,
-      }).catch(() => {})
-      return // Stop heartbeat after timeout
-    }
-
-    // Heartbeat check (only while not timed out)
-    if (currentMessage.status === 'processing') {
-      const period = Math.floor(elapsed_s / HEARTBEAT_INTERVAL_S)
-      if (elapsed_s >= HEARTBEAT_START_S && period > lastHeartbeatPeriod) {
-        lastHeartbeatPeriod = period
-        const waiting = queue.filter(m => m.status === 'queued').length
-        writeLog({ event: 'heartbeat', id: currentMessage.id, elapsed_s, queue_length: waiting })
+      // Timeout check (only fire once)
+      if (elapsed_s >= TIMEOUT_S && currentMessage.status !== 'timeout') {
+        currentMessage.status = 'timeout'
+        await setReaction(currentMessage.channel_id, currentMessage.message_ts, 'alarm_clock')
+        writeLog({ event: 'timeout', id: currentMessage.id, elapsed_s })
         await slackApp.client.chat.postMessage({
           channel: currentMessage.channel_id,
-          text: `仍在处理中... (已用时 ${elapsed_s}s，队列中还有 ${waiting} 条)`,
+          text: `处理已超时(${TIMEOUT_S}s)，仍在等待回复...`,
           thread_ts: currentMessage.thread_ts,
         }).catch(() => {})
+        return // Stop heartbeat after timeout
       }
+
+      // Heartbeat check (only while not timed out)
+      if (currentMessage.status === 'processing') {
+        const period = Math.floor(elapsed_s / HEARTBEAT_INTERVAL_S)
+        if (elapsed_s >= HEARTBEAT_START_S && period > lastHeartbeatPeriod) {
+          lastHeartbeatPeriod = period
+          const waiting = queue.filter(m => m.status === 'queued').length
+          writeLog({ event: 'heartbeat', id: currentMessage.id, elapsed_s, queue_length: waiting })
+          await slackApp.client.chat.postMessage({
+            channel: currentMessage.channel_id,
+            text: `仍在处理中... (已用时 ${elapsed_s}s，队列中还有 ${waiting} 条)`,
+            thread_ts: currentMessage.thread_ts,
+          }).catch(() => {})
+        }
+      }
+    } catch (err: any) {
+      console.error('[timer] unexpected error:', err.message)
     }
   }, TIMER_CHECK_S * 1000)
 }
@@ -332,8 +336,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         await slackApp.client.chat.postMessage({ channel: channel_id, text, thread_ts })
       }
 
-      // Queue bookkeeping
+      // Queue bookkeeping (FIFO: reply always applies to currentMessage)
       if (currentMessage) {
+        if (currentMessage.channel_id !== channel_id || currentMessage.thread_ts !== thread_ts) {
+          console.error(`[reply] WARNING: reply params (${channel_id}:${thread_ts}) do not match current message (${currentMessage.channel_id}:${currentMessage.thread_ts})`)
+        }
         const wasTimeout = currentMessage.status === 'timeout'
         currentMessage.status = 'completed'
         currentMessage.completed_at = Date.now()
