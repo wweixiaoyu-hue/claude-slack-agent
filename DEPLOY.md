@@ -233,6 +233,15 @@ claude --dangerously-skip-permissions --dangerously-load-development-channels se
 
 Windows 上最简单的方式是保持一个终端窗口运行 Claude Code。或者使用 Windows Terminal 的多标签功能。
 
+项目根目录下提供了 `start-slack.bat`，会在启动 Claude Code 的同时在后台拉起 `auto-enter.vbs`（通过 `auto-enter.ps1`），自动按下回车跳过 `--dangerously-load-development-channels` 的 WARNING 确认。用法：
+
+```cmd
+cd /d D:\Code\claude-slack-agent
+start-slack.bat
+```
+
+bat 首行 `cd /d` 的路径需要根据本机项目实际位置调整。
+
 ### 使用 PM2（高级）
 
 > 注意：PM2 管理的是 Claude Code CLI 进程，不是 MCP server。
@@ -246,21 +255,75 @@ pm2 startup  # 设置开机自启
 
 ---
 
+## 服务持续性与重启
+
+### 手动触发重启（Slack DM）
+
+场景：Claude Code 长时间不响应（卡住）或你怀疑认证过期 —— 实践验证重启 Claude Code 父进程即可恢复。
+
+1. 在与 bot 的 **私聊（DM）** 中发送一条消息，内容严格为：`!restart`
+2. Bot 会在 DM 里回复当前队列状态和即将被杀的 PID
+3. `handleRestartCommand` 会：
+   - 把所有未完成消息（queued/processing/timeout）打 ❌ 并写日志
+   - `tasklist` 快照当前所有 `claude.exe` PID
+   - `spawn cmd /c start "" start-slack.bat` 在一个独立的新控制台里拉起一套新的 Claude Code + auto-enter
+   - sleep 1s 让新进程启动
+   - 对快照里每个 PID 执行 `taskkill /F`，只杀老 claude，不影响新起的
+4. 老 claude 死 → MCP stdin EOF → 老 MCP 退出 → 老 bat 也结束
+5. 新 bat 里的 auto-enter.vbs 按 Enter 跳过 WARNING → 新 Claude Code + MCP 上线
+6. 全程中断约 5–10 秒
+
+**限制：**
+- 只限 DM，公共/私有频道里发 `!restart` 会被忽略
+- 必须是白名单用户
+- 30 秒冷却期（防止手抖重复触发）
+- 重启时"处理中"和"队列中"的消息都会被标记为失败（❌ emoji），不会自动重试
+
+### 日志中的重启事件
+
+```bash
+cat ~/.claude/channels/slack/logs/*.jsonl | jq 'select(.event == "restart_triggered")'
+```
+
+每次重启会记录：触发用户、被杀 PID、被丢弃的消息数、时间戳。
+
+### auto-enter 诊断日志
+
+如果自动按 Enter 没生效，查看：
+
+```cmd
+type logs\auto-enter-vbs.log
+type logs\auto-enter.log
+type logs\wrapper.log
+```
+
+`auto-enter.log` 会显示：找到几个 claude 进程、哪个被选中为目标窗口、`SetForegroundWindow` 是否成功、`SendKeys` 是否发出。
+
+---
+
 ## 文件结构
 
 ```
 claude-slack-agent/
 ├── slack-channel.ts          # MCP server 主文件（唯一需要的代码文件）
+├── start-slack.bat           # Windows 启动脚本（调用 auto-enter + claude）
+├── auto-enter.vbs            # 静默启动器，无窗口拉起 powershell
+├── auto-enter.ps1            # 用 Win32 API 激活 claude 窗口并按 Enter 过 WARNING
 ├── package.json              # 依赖声明
 ├── tsconfig.json             # TypeScript 配置
 ├── .mcp.json                 # MCP server 注册（含 Token，不提交 Git）
 ├── .env.example              # Token 模板
-└── .gitignore                # 排除 .env, .mcp.json, node_modules
+└── .gitignore                # 排除 .env, .mcp.json, node_modules, logs
 ```
 
 运行时自动创建的文件：
 
 ```
+claude-slack-agent/logs/
+├── wrapper.log               # bat 启停记录
+├── auto-enter-vbs.log        # vbs 启动器诊断
+└── auto-enter.log            # ps1 窗口激活 + SendKeys 诊断
+
 ~/.claude/channels/slack/
 ├── access.json               # 用户白名单
 └── logs/
