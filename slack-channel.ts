@@ -615,6 +615,12 @@ slackApp.message(async ({ message }) => {
   // Gate on allowlist
   if (!allowlist.has(user)) return
 
+  // Intercept restart command (DM-only, exact-match)
+  if (channel.startsWith('D') && text.trim() === '!restart') {
+    await handleRestartCommand(channel, user)
+    return
+  }
+
   // Resolve user display name
   let userName = 'unknown'
   try {
