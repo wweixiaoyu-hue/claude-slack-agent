@@ -181,8 +181,10 @@ async function handleRestartCommand(
 
   await slackApp.client.chat.postMessage({ channel, text: summary }).catch(() => {})
 
-  // 标记所有未完成消息为失败
-  const toFail = [...queue.filter(m => m.status === 'queued' || m.status === 'processing')]
+  // 标记所有未完成消息为失败（包含 timeout 状态 —— 它们也从未完成）
+  const toFail = queue.filter(m =>
+    m.status === 'queued' || m.status === 'processing' || m.status === 'timeout'
+  )
   for (const m of toFail) {
     m.status = 'failed'
     m.error = 'restart triggered'
@@ -226,6 +228,14 @@ interface LogEntry {
   unfinished_count?: number   // NEW: 重启时被标记失败的消息数
 }
 ```
+
+### 实现说明（避免过度清理）
+
+以下清理逻辑**不需要**在 `handleRestartCommand` 里写——因为 MCP 进程紧接着就会整体退出：
+
+- 不需要调用 `stopTimer()`——heartbeat 定时器随进程退出自动清除
+- 不需要清理 `conversations` Map（30 分钟内的历史会话上下文）——随进程退出丢失。这是**刻意的**：重启的代价就是所有内存状态归零，与"YAGNI：不做跨进程持久化"一致，用户预期明确
+- 汇总消息的 `chat.postMessage` 用 `.catch(() => {})` 包住，即使发送失败也继续执行 taskkill——卡死场景下 Slack API 可能也慢，但必须确保 kill 路径不被阻塞
 
 ## 组件 3：文档更新（`DEPLOY.md`）
 
