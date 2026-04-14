@@ -125,6 +125,10 @@ const HEARTBEAT_INTERVAL_S = 30
 const TIMER_CHECK_S = 10
 const RESERVED_EMOJI = new Set(['eyes', 'hourglass_flowing_sand', 'white_check_mark', 'alarm_clock', 'x'])
 
+// Restart command cooldown
+const RESTART_COOLDOWN_MS = 30_000
+let lastRestartAt = 0
+
 interface QueuedMessage {
   id: string
   text: string
@@ -351,6 +355,75 @@ function stopTimer(): void {
     clearInterval(heartbeatTimer)
     heartbeatTimer = null
   }
+}
+
+// ========== Restart Command ==========
+async function handleRestartCommand(
+  channel: string,
+  userId: string,
+): Promise<void> {
+  const now = Date.now()
+  const since = now - lastRestartAt
+
+  if (since < RESTART_COOLDOWN_MS) {
+    const remaining = Math.ceil((RESTART_COOLDOWN_MS - since) / 1000)
+    await slackApp.client.chat.postMessage({
+      channel,
+      text: `冷却中，请 ${remaining}s 后再试`,
+    }).catch(() => {})
+    return
+  }
+  lastRestartAt = now
+
+  // Resolve trigger user display name for log (best-effort)
+  let triggerName = userId
+  try {
+    const u = await slackApp.client.users.info({ user: userId })
+    triggerName = (u.user as any)?.real_name || (u.user as any)?.name || userId
+  } catch { /* ignore */ }
+
+  // Count unfinished messages
+  const queuedCount = queue.filter(m => m.status === 'queued').length
+  const processing = currentMessage
+  const unfinishedTotal = queuedCount + (processing ? 1 : 0)
+
+  // Build summary message
+  let summary = `收到重启指令 (来自 ${triggerName})。\n`
+  if (processing) {
+    const preview = processing.text.substring(0, 60)
+    summary += `处理中: 1 条 (来自 ${processing.user_name}: "${preview}...")\n`
+  } else {
+    summary += `处理中: 0 条\n`
+  }
+  summary += `队列中: ${queuedCount} 条\n`
+  if (unfinishedTotal > 0) summary += `全部标记为失败。\n`
+  summary += `正在杀掉 PID ${process.ppid}...`
+
+  await slackApp.client.chat.postMessage({ channel, text: summary }).catch(() => {})
+
+  // Mark all unfinished messages (queued/processing/timeout) as failed
+  const toFail = queue.filter(m =>
+    m.status === 'queued' || m.status === 'processing' || m.status === 'timeout'
+  )
+  for (const m of toFail) {
+    m.status = 'failed'
+    m.error = 'restart triggered'
+    await setReaction(m.channel_id, m.message_ts, 'x').catch(() => {})
+    writeLog({ event: 'failed', id: m.id, error: 'restart triggered' })
+  }
+
+  writeLog({
+    event: 'restart_triggered',
+    trigger_user: triggerName,
+    ppid: process.ppid,
+    unfinished_count: unfinishedTotal,
+  })
+
+  // Kill parent Claude Code. /F = force, no /T so MCP dies naturally via stdin EOF.
+  const { exec } = await import('child_process')
+  exec(`taskkill /PID ${process.ppid} /F`, (err) => {
+    if (err) console.error('[restart] taskkill failed:', err.message)
+  })
 }
 
 // ========== MCP Tools ==========
