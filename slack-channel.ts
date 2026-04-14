@@ -3,12 +3,15 @@
 import { App, LogLevel } from '@slack/bolt'
 import * as fs from 'fs'
 import * as path from 'path'
+import { fileURLToPath } from 'url'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ========== Stderr Logger ==========
 // Critical: Bolt must NEVER write to stdout — MCP uses stdout for JSON-RPC.
@@ -397,7 +400,7 @@ async function handleRestartCommand(
   }
   summary += `队列中: ${queuedCount} 条\n`
   if (unfinishedTotal > 0) summary += `全部标记为失败。\n`
-  summary += `正在杀掉 PID ${process.ppid}...`
+  summary += `正在拉起新进程并杀掉 PID ${process.ppid}...`
 
   await slackApp.client.chat.postMessage({ channel, text: summary }).catch(() => {})
 
@@ -419,11 +422,41 @@ async function handleRestartCommand(
     unfinished_count: unfinishedTotal,
   })
 
-  // Kill parent Claude Code. /F = force, no /T so MCP dies naturally via stdin EOF.
-  const { exec } = await import('child_process')
-  exec(`taskkill /PID ${process.ppid} /F`, (err) => {
-    if (err) console.error('[restart] taskkill failed:', err.message)
+  // Snapshot existing claude.exe PIDs BEFORE spawning the new one, so we can
+  // kill only the old ones (process.ppid is unreliable — it may point at
+  // intermediate npx/tsx shells rather than the actual claude.exe).
+  const { spawn, exec, execSync } = await import('child_process')
+  let oldClaudePids: string[] = []
+  try {
+    const out = execSync('tasklist /FI "IMAGENAME eq claude.exe" /NH /FO CSV').toString()
+    oldClaudePids = Array.from(out.matchAll(/"claude\.exe","(\d+)"/g)).map(m => m[1])
+  } catch (e) {
+    console.error('[restart] tasklist failed:', (e as Error).message)
+  }
+  console.error('[restart] old claude.exe PIDs:', oldClaudePids)
+
+  // Spawn a fully detached new start-slack.bat in a new console window.
+  // `cmd /c start` hands it off to a new console outside our process tree.
+  const batPath = path.join(__dirname, 'start-slack.bat')
+  const child = spawn('cmd.exe', ['/c', 'start', '""', batPath], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+    cwd: __dirname,
   })
+  child.unref()
+
+  // Small delay so the new bat + claude.exe have a moment to launch before we
+  // start killing (killing too early can cascade through the job object).
+  await new Promise((r) => setTimeout(r, 1000))
+
+  // Kill each OLD claude.exe PID individually. New claude.exe (not in the
+  // snapshot) survives.
+  for (const pid of oldClaudePids) {
+    exec(`taskkill /PID ${pid} /F`, (err) => {
+      if (err) console.error(`[restart] taskkill PID=${pid} failed:`, err.message)
+    })
+  }
 }
 
 // ========== MCP Tools ==========
