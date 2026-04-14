@@ -140,7 +140,7 @@ interface QueuedMessage {
   error?: string
 }
 
-type LogEvent = 'process_started' | 'enqueued' | 'processing_started' | 'heartbeat' | 'completed' | 'timeout' | 'failed'
+type LogEvent = 'process_started' | 'enqueued' | 'processing_started' | 'heartbeat' | 'completed' | 'timeout' | 'failed' | 'restart_triggered'
 
 interface LogEntry {
   event: LogEvent
@@ -152,6 +152,9 @@ interface LogEntry {
   duration_s?: number
   was_timeout?: boolean
   error?: string
+  trigger_user?: string
+  ppid?: number
+  unfinished_count?: number
 }
 
 function chunkText(text: string, maxLen: number): string[] {
