@@ -160,7 +160,6 @@ Add this function after the `// ========== Queue Functions ==========` block (af
 // ========== Restart Command ==========
 async function handleRestartCommand(
   channel: string,
-  messageTs: string,
   userId: string,
 ): Promise<void> {
   const now = Date.now()
@@ -274,7 +273,7 @@ Insert a new block **between** `if (!allowlist.has(user)) return` and `let userN
 
   // Intercept restart command (DM-only, exact-match)
   if (channel.startsWith('D') && text.trim() === '!restart') {
-    await handleRestartCommand(channel, messageTs, user)
+    await handleRestartCommand(channel, user)
     return
   }
 
